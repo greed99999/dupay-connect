@@ -1,0 +1,19 @@
+{
+  "name": "dupay-connect",
+  "version": "0.1.0",
+  "description": "DUPAY MCP connector — exposes DUPAY tools to Claude.ai and ChatGPT",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "axios": "^1.11.0",
+    "dotenv": "^17.2.2",
+    "express": "^5.2.1",
+    "googleapis": "^171.4.0",
+    "nodemailer": "^8.0.5"
+  }
+}
