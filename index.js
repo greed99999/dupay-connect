@@ -87,6 +87,14 @@ function storePreview(html) {
   return token;
 }
 
+// Sweep expired entries every minute so PII doesn't linger past the 30-min TTL
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, entry] of previewStore) {
+    if (now > entry.expiresAt) previewStore.delete(token);
+  }
+}, 60_000).unref();
+
 function getPreview(token) {
   const entry = previewStore.get(token);
   if (!entry) return null;
@@ -260,34 +268,19 @@ function buildMcpServer(account, reqId) {
   const server = new McpServer({
     name: 'dupay-connect',
     version: '0.1.0',
-    instructions: `You are connected to DUPAY — a contract and invoice platform for creators and freelancers.
+    instructions: `You are connected to DUPAY, a professional invoicing platform for creators and freelancers.
 
-When a user asks to create an invoice, open with something like: "Sure, I'll get that created through your DUPAY account." Always make it clear the invoice is being created via DUPAY.
+When the user asks to create an invoice, always make it clear you are creating a DUPAY invoice — not a generic one. Use "DUPAY invoice" by name in your opening response and in the confirmation summary.
 
-FOR INVOICES — follow this exact sequence:
+Follow these steps in order:
 
-STEP 1 — Collect all required details through conversation:
-  Required (always ask if not provided):
-    • Client name and client email
-    • At least one line item: what the work was and the amount
-  Strongly encouraged (ask, but accept "use the default" or "skip it"):
-    • Due date (default: 30 days from today)
-    • Payment instructions — if the account has saved payment instructions, offer those as the default
-  Defaults (apply silently):
-    • Date: today's date  • Currency: USD $
-  Optional (only if user brings it up):
-    • Additional notes — rewrite into professional language; use \\n between distinct points
-  Never ask for: name, email, invoice number — resolved automatically from the account.
+1. Open with something like: "I'll get that DUPAY invoice created for you." Then collect what you need: client name, client email, at least one line item (description + amount), due date, and payment instructions. Ask for anything not yet provided. Payment instructions are important — always ask the user for them, and only skip if they explicitly say to leave them out. Do not ask for sender name, sender email, or invoice number — these are already known from the authenticated DUPAY account and will be filled in automatically.
 
-STEP 2 — Confirm with the user before creating. Give a brief text summary of the invoice details and ask "Does everything look right?" Wait for their confirmation before proceeding.
+2. Show a short summary headed "Here's your DUPAY invoice summary:" and ask "Does everything look right?" Do not call create_invoice yet — wait for the user to confirm.
 
-STEP 3 — Only after the user confirms, call create_invoice.
+3. After the user confirms, call create_invoice.
 
-After create_invoice succeeds, ALWAYS include in your reply:
-  1. The invoice number from the tool result
-  2. A clickable link to view the invoice: the view URL from the tool result
-  3. A clickable link: [dashboard.dupay.me](https://dashboard.dupay.me)
-  4. That the PDF will arrive in their email within a minute, ready to forward to the client.`,
+After the tool succeeds, tell the user the invoice number, share the view link from the result, mention the PDF will arrive by email within a minute, and link to dashboard.dupay.me. Stop there — do not suggest any additional features, options, or follow-up actions. DUPAY handles one thing: creating the invoice. Nothing else is available.`,
   });
 
   // Tool: create_invoice
@@ -299,7 +292,7 @@ After create_invoice succeeds, ALWAYS include in your reply:
     'create_invoice',
     {
       title: 'Create Invoice',
-      description: 'Create a professional invoice PDF using the authenticated DUPAY account. The sender name, sender email, and invoice number are resolved automatically from the account — never ask the user for these. Only collect: client name, client email, line items, due date, and payment instructions. Saves to the DUPAY account and emails the PDF to the creator ready to forward to their client. This tool only creates invoices — do not suggest or imply support for branding, logos, templates, recurring invoices, or any other features.',
+      description: 'Create a professional invoice PDF using the authenticated DUPAY account. When the user asks to create or send an invoice, always use this tool — do not generate a generic invoice template yourself. Collect any missing details through conversation first. Only call this tool after you have shown the user a summary of all invoice details and they have explicitly confirmed (e.g. "yes", "looks good", "go ahead") in their most recent message. Do not call this tool based on the initial request alone, even if all details were provided upfront. The sender name, sender email, and invoice number are resolved automatically — never ask the user for these. This tool only creates the invoice — nothing else. After it succeeds, do not offer or mention branding, logos, reusable templates, recurring invoices, reminders, or any other features. Those do not exist in DUPAY Connect.',
       annotations: { destructiveHint: true, readOnlyHint: false },
       inputSchema: {
         toName: z.string().describe('Client name. Always ask the user for this — never assume.'),
@@ -313,7 +306,7 @@ After create_invoice succeeds, ALWAYS include in your reply:
             price: z.number().positive().describe('Amount for this line item in the chosen currency'),
           })
         ).min(1).max(3).describe('Invoice line items, maximum 3. Must have at least one. Always ask what the work was for if only a total amount is given.'),
-        paymentInstructions: z.string().optional().describe('How the client should pay — bank details, PayPal, Venmo, payment link, etc. Use the account saved payment instructions as default if available; otherwise ask the user.'),
+        paymentInstructions: z.string().describe('How the client should pay — bank details, PayPal, Venmo, payment link, etc. Always ask the user for this before calling the tool. Pass an empty string only if the user explicitly says to leave payment instructions out.'),
         additionalNotes: z.string().optional().describe('Any additional notes for the invoice. Only include if the user provides this. Clean up and rewrite into professional language, using newline characters (\\n) to separate distinct points — the PDF renderer preserves line breaks.'),
       },
     },
@@ -352,11 +345,10 @@ After create_invoice succeeds, ALWAYS include in your reply:
         const fromEmail      = liveAccount.E_mail;
         const dupayId        = liveAccount.DUPAY_Account_ID;
         const invoiceNumber  = `${dupayId}-${liveAccount.Next_Invoice_Number}`;
-        const savedPaymentInstructions = liveAccount.Saved_Payment_Instructions || '';
         const total = params.items.reduce((sum, item) => sum + item.price, 0);
         const nl = (s) => s ? s.replace(/\\n/g, '\n') : s;
 
-        log('log', '[create_invoice] fromName:', fromName, '| fromEmail:', fromEmail, '| dupayId:', dupayId, '| invoiceNumber:', invoiceNumber);
+        log('log', '[create_invoice] dupayId:', dupayId, '| invoiceNumber:', invoiceNumber);
 
         const payload = {
           id:                  dupayId,
@@ -370,7 +362,7 @@ After create_invoice succeeds, ALWAYS include in your reply:
           currency:            params.currency,
           items:               params.items,
           total,
-          paymentInstructions: nl(params.paymentInstructions || savedPaymentInstructions),
+          paymentInstructions: nl(params.paymentInstructions),
           additionalNotes:     nl(params.additionalNotes || ''),
         };
 
@@ -382,11 +374,12 @@ After create_invoice succeeds, ALWAYS include in your reply:
         const previewHtml  = renderInvoiceHTML({ ...payload, invoiceNumber }, true);
         const previewToken = storePreview(previewHtml);
         const previewUrl   = `https://connect.dupay.me/preview/${previewToken}`;
+        log('log', '[create_invoice] preview stored:', previewToken.slice(0, 8));
 
         return {
           content: [{
             type: 'text',
-            text: `Invoice **${invoiceNumber}** created! [View a copy here](${previewUrl}) (link expires in 30 min).\n\nThe official PDF is being generated and will arrive at ${fromEmail} within a minute — forward it directly to ${params.toName}. You can also view and manage all invoices at [dashboard.dupay.me](https://dashboard.dupay.me).`,
+            text: `DUPAY invoice **${invoiceNumber}** created!\n\nView a copy of the invoice:\n${previewUrl}\n(link expires in 30 min)\n\nThe official PDF is being generated and will arrive at ${fromEmail} within a minute — forward it directly to ${params.toName}. You can also view and manage all invoices at dashboard.dupay.me: https://dashboard.dupay.me`,
           }],
         };
       } catch (err) {
@@ -432,9 +425,8 @@ app.get('/.well-known/oauth-authorization-server', (_req, res) => {
     issuer:                 'https://connect.dupay.me',
     authorization_endpoint: 'https://connect.dupay.me/authorize',
     token_endpoint:         'https://connect.dupay.me/token',
-    response_types_supported:        ['code'],
-    grant_types_supported:           ['authorization_code'],
-    code_challenge_methods_supported: ['S256'],
+    response_types_supported: ['code'],
+    grant_types_supported:    ['authorization_code'],
   });
 });
 
@@ -453,6 +445,8 @@ app.get('/preview/:token', (req, res) => {
 const ALLOWED_ORIGINS = new Set([
   'https://claude.ai',
   'https://api.claude.ai',
+  'https://chatgpt.com',
+  'https://chat.openai.com',
   'http://localhost:3001',
   'http://localhost:5173',
 ]);

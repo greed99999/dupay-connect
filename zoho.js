@@ -31,15 +31,15 @@ async function zoho(method, path, data) {
   return res.data;
 }
 
-// Find active account by email — returns null if not found or subscription is cancelled
+// Find account by email — returns { account, active } or null if not in Zoho at all
 export async function findAccountByEmail(email) {
   const res = await zoho('get', `/Accounts/search?criteria=(E_mail:equals:${encodeURIComponent(email)})`);
   const account = res.data?.[0] || null;
   if (!account) return null;
   const status = account.Account_Subscription_Status;
   const allowed = ['Active', 'Cancellation Pending'];
-  if (status && !allowed.includes(status)) return null;
-  return account;
+  const active = !status || allowed.includes(status);
+  return { account, active };
 }
 
 // Find account by mcp_auth_code

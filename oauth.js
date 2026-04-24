@@ -7,29 +7,47 @@ import { setToken } from './tokenStore.js';
 const router = Router();
 
 // In-memory auth code store — codes expire in 15 min and don't need to survive restarts
-const authCodeStore = new Map(); // code -> { accountId, expiry }
+const authCodeStore = new Map(); // code -> { accountId, redirectUri, expiry }
 
-// Per-email cooldown — prevents duplicate emails if the client fires the form twice
-const recentlySent = new Map(); // email -> sentAt (ms)
+// Per-email+platform cooldown — prevents duplicate emails if the client fires the form twice
+const recentlySent = new Map(); // `${email}:${platform}` -> sentAt (ms)
 const SEND_COOLDOWN_MS = 30_000;
 
-// Detect the AI platform from the redirect_uri
+// Allowed redirect_uri hostnames — prevents phishing via crafted redirect_uri
+const ALLOWED_REDIRECT_HOSTS = new Set(['claude.ai', 'chatgpt.com', 'chat.openai.com']);
+
+// Detect platform from redirect_uri using hostname — not substring match
 function detectPlatform(redirectUri) {
   if (!redirectUri) return 'your AI assistant';
-  if (redirectUri.includes('claude.ai')) return 'Claude';
-  if (redirectUri.includes('chatgpt.com') || redirectUri.includes('openai.com')) return 'ChatGPT';
+  try {
+    const host = new URL(redirectUri).hostname;
+    if (host === 'claude.ai') return 'Claude';
+    if (host === 'chatgpt.com' || host === 'chat.openai.com') return 'ChatGPT';
+  } catch {}
   return 'your AI assistant';
+}
+
+function isAllowedRedirectUri(redirectUri) {
+  try {
+    return ALLOWED_REDIRECT_HOSTS.has(new URL(redirectUri).hostname);
+  } catch {
+    return false;
+  }
 }
 
 // ─── GET /authorize ───────────────────────────────────────────────
 // AI client redirects here to start the OAuth flow.
 // Serves a simple email entry form.
 router.get('/authorize', (req, res) => {
-  const { redirect_uri, state, client_id } = req.query;
+  const { redirect_uri, state } = req.query;
   const platform = detectPlatform(redirect_uri);
 
   if (!redirect_uri || !state) {
     return res.status(400).send('Missing redirect_uri or state');
+  }
+
+  if (!isAllowedRedirectUri(redirect_uri)) {
+    return res.status(400).send('Invalid redirect_uri');
   }
 
   res.send(`<!DOCTYPE html>
@@ -80,45 +98,68 @@ router.post('/authorize', async (req, res) => {
     return res.status(400).send('Missing required fields');
   }
 
-  const account = await findAccountByEmail(email);
-  console.log('[authorize] email:', email, '| account found:', !!account, account?.id);
-
-  // No account — redirect to pricing page so they can sign up
-  if (!account) {
-    return res.redirect('https://dupayme.com/pricing/');
+  if (!isAllowedRedirectUri(redirect_uri)) {
+    return res.status(400).send('Invalid redirect_uri');
   }
 
-  if (account) {
-    // Deduplicate: if we sent a link to this email in the last 30s, don't send again
-    const lastSent = recentlySent.get(email);
+  let result;
+  try {
+    result = await findAccountByEmail(email);
+  } catch (err) {
+    console.error('[authorize] findAccountByEmail error:', err.response?.status, err.response?.data || err.message);
+    return res.status(500).send('An error occurred. Please try again.');
+  }
+  console.log('[authorize] email:', email, '| found:', !!result, '| active:', result?.active);
+
+  // Always show the same success page regardless of account status — no enumeration oracle.
+  if (result && !result.active) {
+    // Known contact with cancelled/inactive subscription — send a reactivation nudge
+    const dedupKey = `${email}:cancelled`;
+    const lastSent = recentlySent.get(dedupKey);
+    if (!lastSent || Date.now() - lastSent >= SEND_COOLDOWN_MS) {
+      recentlySent.set(dedupKey, Date.now());
+      await sendEmail({
+        to:      email,
+        subject: 'Your DUPAY subscription is not active',
+        html:    cancelledAccountEmail(platform),
+      }).catch(err => console.error('[authorize] cancelled email send failed:', err.message));
+    }
+  }
+
+  if (result?.active) {
+    const { account } = result;
+    // Deduplicate: keyed on email+platform so Claude and ChatGPT each get their own link
+    const dedupKey = `${email}:${platform}`;
+    const lastSent = recentlySent.get(dedupKey);
     if (lastSent && Date.now() - lastSent < SEND_COOLDOWN_MS) {
-      console.log('[authorize] duplicate request suppressed for:', email);
-      // fall through to show success page without sending
+      console.log('[authorize] duplicate request suppressed for:', dedupKey);
     } else {
-    recentlySent.set(email, Date.now());
+      recentlySent.set(dedupKey, Date.now());
 
-    const code    = randomUUID();
-    const expiry  = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+      const code   = randomUUID();
+      const expiry = new Date(Date.now() + 15 * 60 * 1000).toISOString();
 
-    authCodeStore.set(code, { accountId: account.id, expiry });
-    console.log('[authorize] stored code in memory:', code);
+      // Bind the auth code to this redirect_uri — validated again at /token
+      authCodeStore.set(code, { accountId: account.id, redirectUri: redirect_uri, expiry });
+      console.log('[authorize] stored code in memory:', code);
 
-    // Also write to Zoho for audit trail (non-blocking)
-    updateAccount(account.id, {
-      mcp_auth_code:        code,
-      mcp_auth_code_expiry: expiry,
-    }).catch(err => console.error('[authorize] Zoho update failed (non-fatal):', err.message));
+      // Also write to Zoho for audit trail (non-blocking)
+      updateAccount(account.id, {
+        mcp_auth_code:        code,
+        mcp_auth_code_expiry: expiry,
+      }).catch(err => console.error('[authorize] Zoho update failed (non-fatal):', err.message));
 
-    const magicLink = `https://connect.dupay.me/callback?code=${code}&state=${encodeURIComponent(state)}&redirect_uri=${encodeURIComponent(redirect_uri)}`;
+      const magicLink = `https://connect.dupay.me/callback?code=${code}&state=${encodeURIComponent(state)}&redirect_uri=${encodeURIComponent(redirect_uri)}`;
 
-    await sendEmail({
-      to:      email,
-      subject: `Connect DUPAY to ${platform} — your magic link`,
-      html:    magicLinkEmail(magicLink, platform),
-    });
-    } // end else (not duplicate)
+      await sendEmail({
+        to:      email,
+        subject: `Connect DUPAY to ${platform} - your magic link`,
+        html:    magicLinkEmail(magicLink, platform),
+      });
+    }
   }
 
+  // Same response for registered and unregistered — no enumeration oracle
   res.send(`<!DOCTYPE html>
 <html>
 <head>
@@ -133,20 +174,23 @@ router.post('/authorize', async (req, res) => {
     .icon { width: 56px; height: 56px; background: #b9fb9c; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 1.25rem; font-size: 1.5rem; }
     h2 { font-size: 1.2rem; font-weight: 700; color: #04151f; margin-bottom: 0.75rem; }
     p { font-size: 0.9rem; color: #6b7280; line-height: 1.6; }
+    .signup { margin-top: 1.25rem; font-size: 0.8rem; color: #9ca3af; }
+    .signup a { color: #16a34a; text-decoration: none; font-weight: 600; }
   </style>
 </head>
 <body>
   <div class="card">
     <div class="icon">✉</div>
     <h2>Check your email</h2>
-    <p>If <strong>${encodeHTML(email)}</strong> is registered with DUPAY, you'll receive a magic link shortly.<br><br>Click the link to complete connecting Claude to your account. It expires in 15 minutes.</p>
+    <p>If <strong>${encodeHTML(email)}</strong> is registered with DUPAY, you'll receive a magic link shortly.<br><br>Click the link to complete connecting ${platform} to your account. It expires in 15 minutes.</p>
+    <p class="signup">Not a DUPAY customer yet? <a href="https://dupayme.com/pricing/">Sign up here</a></p>
   </div>
 </body>
 </html>`);
 });
 
 // ─── GET /callback ────────────────────────────────────────────────
-// User clicks magic link. Validates code, redirects to Claude.ai.
+// User clicks magic link. Validates code, redirects to the AI client.
 router.get('/callback', async (req, res) => {
   const { code, state, redirect_uri } = req.query;
 
@@ -166,15 +210,19 @@ router.get('/callback', async (req, res) => {
     return res.status(400).send('This link has expired. Please start again from your AI assistant.');
   }
 
-  // Redirect to Claude.ai — it will exchange the code at /token
+  // Verify the redirect_uri matches what was stored at authorization time
+  if (redirect_uri !== pending.redirectUri) {
+    return res.status(400).send('redirect_uri mismatch.');
+  }
+
   const redirectUrl = `${redirect_uri}?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`;
   res.redirect(redirectUrl);
 });
 
 // ─── POST /token ──────────────────────────────────────────────────
-// Claude.ai exchanges the auth code for a Bearer access token.
+// AI client exchanges the auth code for a Bearer access token.
 router.post('/token', async (req, res) => {
-  const { grant_type, code } = req.body;
+  const { grant_type, code, redirect_uri } = req.body;
 
   if (grant_type !== 'authorization_code') {
     return res.status(400).json({ error: 'unsupported_grant_type' });
@@ -190,6 +238,11 @@ router.post('/token', async (req, res) => {
   if (new Date(pending.expiry) < new Date()) {
     authCodeStore.delete(code);
     return res.status(400).json({ error: 'invalid_grant', error_description: 'Code expired' });
+  }
+
+  // Validate redirect_uri matches what was bound at authorization time
+  if (redirect_uri && redirect_uri !== pending.redirectUri) {
+    return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
   }
 
   authCodeStore.delete(code);
@@ -224,6 +277,42 @@ function encodeHTML(str) {
     .replace(/"/g, '&quot;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+function cancelledAccountEmail(platform = 'your AI assistant') {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0;padding:0;background-color:#f8f9fa;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;line-height:1.6;">
+  <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;max-width:600px;margin:0 auto;padding:20px;">
+    <tr><td>
+      <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;background-color:#ffffff;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.08);">
+        <tr>
+          <td style="padding:32px;">
+            <div style="font-weight:700;font-size:24px;color:#0b1320;margin-bottom:20px;">DUPAY</div>
+            <p style="color:#0b1320;font-size:16px;margin:0 0 16px 0;">Hi there,</p>
+            <p style="color:#374151;font-size:15px;margin:0 0 16px 0;">You tried to connect your DUPAY account to ${platform}, but your subscription is no longer active.</p>
+            <p style="color:#374151;font-size:15px;margin:0 0 24px 0;">To reconnect, you'll need to reactivate or upgrade your plan.</p>
+            <table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 24px 0;">
+              <tr>
+                <td align="center" style="background-color:#16a34a;border-radius:8px;">
+                  <a href="https://dupayme.com/pricing/" target="_blank" style="display:inline-block;color:#ffffff !important;text-decoration:none !important;padding:14px 28px;font-size:16px;font-weight:600;">
+                    View Plans &amp; Pricing →
+                  </a>
+                </td>
+              </tr>
+            </table>
+            <p style="color:#6b7280;font-size:13px;margin:0;">Questions? Contact us at info(at)dupay.me</p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
 }
 
 function magicLinkEmail(link, platform = 'your AI assistant') {
