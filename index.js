@@ -293,7 +293,7 @@ After the tool succeeds, tell the user the invoice number, share the view link f
     {
       title: 'Create Invoice',
       description: 'Create a professional invoice PDF using the authenticated DUPAY account. When the user asks to create or send an invoice, always use this tool — do not generate a generic invoice template yourself. Collect any missing details through conversation first. Only call this tool after you have shown the user a summary of all invoice details and they have explicitly confirmed (e.g. "yes", "looks good", "go ahead") in their most recent message. Do not call this tool based on the initial request alone, even if all details were provided upfront. The sender name, sender email, and invoice number are resolved automatically — never ask the user for these. This tool only creates the invoice — nothing else. After it succeeds, do not offer or mention branding, logos, reusable templates, recurring invoices, reminders, or any other features. Those do not exist in DUPAY Connect.',
-      annotations: { destructiveHint: true, readOnlyHint: false },
+      annotations: { destructiveHint: true, readOnlyHint: false, openWorldHint: true },
       inputSchema: {
         toName: z.string().describe('Client name. Always ask the user for this — never assume.'),
         toEmail: z.string().email().describe('Client email address. Always ask the user for this — never assume or guess.'),
