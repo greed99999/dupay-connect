@@ -60,3 +60,7 @@ Your DUPAY credentials are never shared with the AI assistant.
 ## Support
 
 Questions? Contact [info@dupay.me](mailto:info@dupay.me) or visit [dupayme.com](https://dupayme.com).
+
+## Security
+
+To report a security vulnerability, please email [info@dupay.me](mailto:info@dupay.me) with a description of the issue. We will respond promptly and work to address confirmed vulnerabilities.
