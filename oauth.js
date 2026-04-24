@@ -174,8 +174,6 @@ router.post('/authorize', async (req, res) => {
     .icon { width: 56px; height: 56px; background: #b9fb9c; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 1.25rem; font-size: 1.5rem; }
     h2 { font-size: 1.2rem; font-weight: 700; color: #04151f; margin-bottom: 0.75rem; }
     p { font-size: 0.9rem; color: #6b7280; line-height: 1.6; }
-    .signup { margin-top: 1.25rem; font-size: 0.8rem; color: #9ca3af; }
-    .signup a { color: #16a34a; text-decoration: none; font-weight: 600; }
   </style>
 </head>
 <body>
@@ -183,7 +181,6 @@ router.post('/authorize', async (req, res) => {
     <div class="icon">✉</div>
     <h2>Check your email</h2>
     <p>If <strong>${encodeHTML(email)}</strong> is registered with DUPAY, you'll receive a magic link shortly.<br><br>Click the link to complete connecting ${platform} to your account. It expires in 15 minutes.</p>
-    <p class="signup">Not a DUPAY customer yet? <a href="https://dupayme.com/pricing/">Sign up here</a></p>
   </div>
 </body>
 </html>`);
